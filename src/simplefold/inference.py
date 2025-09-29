@@ -5,7 +5,6 @@
 
 import os
 import torch
-import hydra
 import omegaconf
 import argparse
 import numpy as np
@@ -69,7 +68,8 @@ def initialize_folding_model(args):
     if args.backend == 'torch':
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_config = omegaconf.OmegaConf.load(cfg_path)
-        model = hydra.utils.instantiate(model_config)
+        from utils.instantiate import instantiate as instantiate_cfg
+        model = instantiate_cfg(model_config)
         model.load_state_dict(checkpoint, strict=True)
         model = model.to(device)
     elif args.backend == 'mlx':
@@ -80,7 +80,8 @@ def initialize_folding_model(args):
         yaml_str = yaml_str.replace('torch', 'mlx')
 
         model_config = omegaconf.OmegaConf.create(yaml_str)
-        model = hydra.utils.instantiate(model_config)
+        from utils.instantiate import instantiate as instantiate_cfg
+        model = instantiate_cfg(model_config)
         mlx_state_dict = {k: mx.array(v) for k, v in starmap(map_torch_to_mlx, checkpoint.items()) if k is not None}
         model.update(tree_unflatten(list(mlx_state_dict.items())))
     print(f"Folding model {simplefold_model} loaded.")
@@ -104,7 +105,8 @@ def initialize_plddt_module(args, device):
 
     if args.backend == "torch":
         plddt_config = omegaconf.OmegaConf.load(plddt_module_path)
-        plddt_out_module = hydra.utils.instantiate(plddt_config)
+        from utils.instantiate import instantiate as instantiate_cfg
+        plddt_out_module = instantiate_cfg(plddt_config)
         plddt_out_module.load_state_dict(plddt_checkpoint, strict=True)
         plddt_out_module = plddt_out_module.to(device)
     elif args.backend == "mlx":
@@ -114,7 +116,8 @@ def initialize_plddt_module(args, device):
         yaml_str = yaml_str.replace('torch', 'mlx')
 
         plddt_config = omegaconf.OmegaConf.create(yaml_str)
-        plddt_out_module = hydra.utils.instantiate(plddt_config)
+        from utils.instantiate import instantiate as instantiate_cfg
+        plddt_out_module = instantiate_cfg(plddt_config)
 
         mlx_state_dict = {k: mx.array(v) for k, v in starmap(map_plddt_torch_to_mlx, plddt_checkpoint.items()) if k is not None}
         plddt_out_module.update(tree_unflatten(list(mlx_state_dict.items())))
@@ -132,7 +135,8 @@ def initialize_plddt_module(args, device):
 
     if args.backend == "torch":
         plddt_latent_config = omegaconf.OmegaConf.load(plddt_latent_config_path)
-        plddt_latent_module = hydra.utils.instantiate(plddt_latent_config)
+        from utils.instantiate import instantiate as instantiate_cfg
+        plddt_latent_module = instantiate_cfg(plddt_latent_config)
         plddt_latent_module.load_state_dict(plddt_latent_checkpoint, strict=True)
         plddt_latent_module = plddt_latent_module.to(device)
     elif args.backend == "mlx":
@@ -142,7 +146,8 @@ def initialize_plddt_module(args, device):
         yaml_str = yaml_str.replace('torch', 'mlx')
 
         plddt_latent_config = omegaconf.OmegaConf.create(yaml_str)
-        plddt_latent_module = hydra.utils.instantiate(plddt_latent_config)
+        from utils.instantiate import instantiate as instantiate_cfg
+        plddt_latent_module = instantiate_cfg(plddt_latent_config)
         mlx_state_dict = {k: mx.array(v) for k, v in starmap(map_torch_to_mlx, plddt_latent_checkpoint.items()) if k is not None}
         plddt_latent_module.update(tree_unflatten(list(mlx_state_dict.items())))
 

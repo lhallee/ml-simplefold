@@ -7,7 +7,7 @@ import os
 import shlex
 import subprocess
 import torch
-import hydra
+from utils.instantiate import instantiate as instantiate_cfg
 from typing import List
 from lightning import Callback
 from lightning.pytorch.loggers import Logger
@@ -28,7 +28,7 @@ def instantiate_trainer(trainer_cfg: DictConfig, callbacks, logger, plugins):
     if "mixed_precision" in trainer_cfg.strategy.keys():
 
         # mp_config = trainer_cfg.st
-        mp = hydra.utils.instantiate(trainer_cfg.strategy.mixed_precision)
+        mp = instantiate_cfg(trainer_cfg.strategy.mixed_precision)
         mp = mp(
             param_dtype=dtype_lookup[trainer_cfg.strategy.mixed_precision.param_dtype],
             reduce_dtype=dtype_lookup[
@@ -38,9 +38,9 @@ def instantiate_trainer(trainer_cfg: DictConfig, callbacks, logger, plugins):
                 trainer_cfg.strategy.mixed_precision.buffer_dtype
             ],
         )
-        strategy = hydra.utils.instantiate(trainer_cfg.strategy)
+        strategy = instantiate_cfg(trainer_cfg.strategy)
         strategy.mixed_precision = mp
-        trainer = hydra.utils.instantiate(
+        trainer = instantiate_cfg(
             trainer_cfg,
             strategy=strategy,
             callbacks=callbacks,
@@ -48,7 +48,7 @@ def instantiate_trainer(trainer_cfg: DictConfig, callbacks, logger, plugins):
             plugins=plugins,
         )
     else:
-        trainer = hydra.utils.instantiate(
+        trainer = instantiate_cfg(
             trainer_cfg, callbacks=callbacks, logger=logger, plugins=plugins
         )
 
@@ -73,7 +73,7 @@ def instantiate_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
     for _, cb_conf in callbacks_cfg.items():
         if isinstance(cb_conf, DictConfig) and "_target_" in cb_conf:
             log.info(f"Instantiating callback <{cb_conf._target_}>")
-            callbacks.append(hydra.utils.instantiate(cb_conf))
+            callbacks.append(instantiate_cfg(cb_conf))
 
     return callbacks
 
@@ -96,7 +96,7 @@ def instantiate_loggers(logger_cfg: DictConfig) -> List[Logger]:
     for _, lg_conf in logger_cfg.items():
         if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
             log.info(f"Instantiating logger <{lg_conf._target_}>")
-            logger.append(hydra.utils.instantiate(lg_conf))
+            logger.append(instantiate_cfg(lg_conf))
             if "TensorBoard" in lg_conf._target_:
                 build_tensorboard(os.environ.get("BOLT_LOG_DIR"))
     return logger

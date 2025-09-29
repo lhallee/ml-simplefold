@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Apple Inc. Licensed under MIT License.
 #
 
-import hydra
+import argparse
 import torch
 from omegaconf import OmegaConf
 import lightning.pytorch as pl
@@ -13,6 +13,8 @@ from lightning.pytorch import (
 )
 
 from utils.utils import extras, create_folders, task_wrapper
+from utils.config import load_config
+from utils.instantiate import instantiate as instantiate_cfg
 from utils.instantiators import instantiate_callbacks
 from utils.logging_utils import log_hyperparameters
 from utils.pylogger import RankedLogger
@@ -27,7 +29,7 @@ def test(cfg):
     assert load_ckpt_path != None
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
+    model: LightningModule = instantiate_cfg(cfg.model)
 
     checkpoint = torch.load(load_ckpt_path, map_location="cpu", weights_only=False)
 
@@ -55,13 +57,13 @@ def test(cfg):
     pl.seed_everything(seed, workers=True)
 
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+    datamodule: LightningDataModule = instantiate_cfg(cfg.data)
 
     log.info("Instantiating callbacks...")
     callbacks = instantiate_callbacks(cfg.get("callbacks"))
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer = hydra.utils.instantiate(
+    trainer = instantiate_cfg(
         cfg.trainer, callbacks=callbacks, logger=[], plugins=[]
     )
 
@@ -82,9 +84,12 @@ def test(cfg):
     trainer.predict(model=model, datamodule=datamodule, ckpt_path=None)
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="base_eval.yaml")
-def submit_run(cfg):
-    OmegaConf.resolve(cfg)
+def submit_run():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=str(Path(__file__).resolve().parents[2] / "configs" / "base_eval.yaml"))
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
     extras(cfg)
     create_folders(cfg)
     test(cfg)

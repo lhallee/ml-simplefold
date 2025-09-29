@@ -5,7 +5,6 @@
 
 import os
 import torch
-import hydra
 import omegaconf
 from pathlib import Path
 from itertools import starmap
@@ -92,7 +91,8 @@ class ModelWrapper:
         )
         if self.backend == "torch":
             model_config = omegaconf.OmegaConf.load(cfg_path)
-            model = hydra.utils.instantiate(model_config)
+            from utils.instantiate import instantiate as instantiate_cfg
+            model = instantiate_cfg(model_config)
             model.load_state_dict(checkpoint, strict=True)
             model = model.to(self.device)
         elif self.backend == "mlx":
@@ -102,7 +102,8 @@ class ModelWrapper:
             yaml_str = yaml_str.replace("torch", "mlx")
 
             model_config = omegaconf.OmegaConf.create(yaml_str)
-            model = hydra.utils.instantiate(model_config)
+            from utils.instantiate import instantiate as instantiate_cfg
+            model = instantiate_cfg(model_config)
             mlx_state_dict = {
                 k: mx.array(v)
                 for k, v in starmap(map_torch_to_mlx, checkpoint.items())
@@ -133,7 +134,8 @@ class ModelWrapper:
 
         if self.backend == "torch":
             plddt_config = omegaconf.OmegaConf.load(plddt_module_path)
-            plddt_out_module = hydra.utils.instantiate(plddt_config)
+            from utils.instantiate import instantiate as instantiate_cfg
+            plddt_out_module = instantiate_cfg(plddt_config)
             plddt_out_module.load_state_dict(plddt_checkpoint, strict=True)
             plddt_out_module = plddt_out_module.to(self.device)
         elif self.backend == "mlx":
@@ -143,7 +145,8 @@ class ModelWrapper:
             yaml_str = yaml_str.replace("torch", "mlx")
 
             plddt_config = omegaconf.OmegaConf.create(yaml_str)
-            plddt_out_module = hydra.utils.instantiate(plddt_config)
+            from utils.instantiate import instantiate as instantiate_cfg
+            plddt_out_module = instantiate_cfg(plddt_config)
 
             mlx_state_dict = {
                 k: mx.array(v)
@@ -169,7 +172,8 @@ class ModelWrapper:
 
         if self.backend == "torch":
             plddt_latent_config = omegaconf.OmegaConf.load(plddt_latent_config_path)
-            plddt_latent_module = hydra.utils.instantiate(plddt_latent_config)
+            from utils.instantiate import instantiate as instantiate_cfg
+            plddt_latent_module = instantiate_cfg(plddt_latent_config)
             plddt_latent_module.load_state_dict(plddt_latent_checkpoint, strict=True)
             plddt_latent_module = plddt_latent_module.to(self.device)
         elif self.backend == "mlx":
@@ -179,7 +183,8 @@ class ModelWrapper:
             yaml_str = yaml_str.replace("torch", "mlx")
 
             plddt_latent_config = omegaconf.OmegaConf.create(yaml_str)
-            plddt_latent_module = hydra.utils.instantiate(plddt_latent_config)
+            from utils.instantiate import instantiate as instantiate_cfg
+            plddt_latent_module = instantiate_cfg(plddt_latent_config)
             mlx_state_dict = {
                 k: mx.array(v)
                 for k, v in starmap(map_torch_to_mlx, plddt_latent_checkpoint.items())

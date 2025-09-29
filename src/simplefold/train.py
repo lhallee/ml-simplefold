@@ -6,8 +6,9 @@
 import torch
 import lightning.pytorch as pl
 from lightning.pytorch import LightningDataModule, LightningModule
-import hydra
 from omegaconf import OmegaConf
+import argparse
+from utils.config import load_config
 
 from utils.utils import (
     extras,
@@ -35,7 +36,8 @@ def train(cfg):
     pl.seed_everything(seed, workers=True)
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
+    from utils.instantiate import instantiate as instantiate_cfg
+    model: LightningModule = instantiate_cfg(cfg.model)
     load_ckpt_path = cfg.get("load_ckpt_path", None)
 
     if load_ckpt_path is not None:
@@ -51,7 +53,7 @@ def train(cfg):
         model.reset_esm(cfg.model.esm_model)
 
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+    datamodule: LightningDataModule = instantiate_cfg(cfg.data)
 
     log.info("Instantiating callbacks...")
     callbacks = instantiate_callbacks(cfg.get("callbacks"))
@@ -86,9 +88,12 @@ def train(cfg):
     )
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="base_train.yaml")
-def submit_run(cfg):
-    OmegaConf.resolve(cfg)
+def submit_run():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=str(Path(__file__).resolve().parents[2] / "configs" / "base_train.yaml"))
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
     extras(cfg)
     create_folders(cfg)
     train(cfg)
