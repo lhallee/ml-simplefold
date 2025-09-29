@@ -36,3 +36,4 @@ lightgbm
 pyfiglet
 matplotlib>=3.9.0
 sentencepiece
+omegaconf
