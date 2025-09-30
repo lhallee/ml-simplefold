@@ -15,11 +15,12 @@ from torch.nn.functional import one_hot, pad
 from einops import repeat, rearrange
 from dataclasses import astuple, dataclass, asdict
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Optional
 from pathlib import Path
-
-
+from types import SimpleNamespace
+from tqdm import tqdm
 from transformers import AutoModel, PretrainedConfig, PreTrainedModel
+
 
 ckpt_url_dict = {
     "simplefold_100M": "https://ml-site.cdn-apple.com/models/simplefold/simplefold_100M.ckpt",
@@ -33,6 +34,82 @@ ckpt_url_dict = {
 plddt_ckpt_url = (
     "https://ml-site.cdn-apple.com/models/simplefold/plddt_module_1.6B.ckpt"
 )
+
+mx = None  # optional MLX placeholder
+
+
+# Minimal residue and token constants required for direct-from-sequence tokenization
+residue_constants = SimpleNamespace()
+residue_constants.restypes = [
+    "A", "R", "N", "D", "C", "Q", "E", "G", "H", "I",
+    "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V",
+]
+residue_constants.restypes_with_x = list(residue_constants.restypes) + ["X"]
+residue_constants.restype_order_with_x = {
+    aa: i for i, aa in enumerate(residue_constants.restypes_with_x)
+}
+
+# Subset of boltz constants used in tokenization/featurization
+class _Const:
+    pass
+
+const = _Const()
+
+const.chain_types = ["PROTEIN", "DNA", "RNA", "NONPOLYMER"]
+const.chain_type_ids = {c: i for i, c in enumerate(const.chain_types)}
+
+const.tokens = [
+    "<pad>", "-",
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "UNK",
+    # nucleic placeholders kept for dtype compatibility
+    "A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN",
+]
+const.token_ids = {t: i for i, t in enumerate(const.tokens)}
+const.num_tokens = len(const.tokens)
+const.unk_token = {"PROTEIN": "UNK", "DNA": "DN", "RNA": "N"}
+const.num_elements = 128
+const.pocket_contact_info = {"UNSPECIFIED": 0, "UNSELECTED": 1, "POCKET": 2, "BINDER": 3}
+
+# Three-letter protein residue atom definitions (subset for proteins)
+const.ref_atoms = {
+    "PAD": [],
+    "UNK": ["N", "CA", "C", "O", "CB"],
+    "-": [],
+    "ALA": ["N", "CA", "C", "O", "CB"],
+    "ARG": ["N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2"],
+    "ASN": ["N", "CA", "C", "O", "CB", "CG", "OD1", "ND2"],
+    "ASP": ["N", "CA", "C", "O", "CB", "CG", "OD1", "OD2"],
+    "CYS": ["N", "CA", "C", "O", "CB", "SG"],
+    "GLN": ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "NE2"],
+    "GLU": ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2"],
+    "GLY": ["N", "CA", "C", "O"],
+    "HIS": ["N", "CA", "C", "O", "CB", "CG", "ND1", "CD2", "CE1", "NE2"],
+    "ILE": ["N", "CA", "C", "O", "CB", "CG1", "CG2", "CD1"],
+    "LEU": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2"],
+    "LYS": ["N", "CA", "C", "O", "CB", "CG", "CD", "CE", "NZ"],
+    "MET": ["N", "CA", "C", "O", "CB", "CG", "SD", "CE"],
+    "PHE": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+    "PRO": ["N", "CA", "C", "O", "CB", "CG", "CD"],
+    "SER": ["N", "CA", "C", "O", "CB", "OG"],
+    "THR": ["N", "CA", "C", "O", "CB", "OG1", "CG2"],
+    "TRP": [
+        "N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "NE1", "CE2",
+        "CE3", "CZ2", "CZ3", "CH2",
+    ],
+    "TYR": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH"],
+    "VAL": ["N", "CA", "C", "O", "CB", "CG1", "CG2"],
+}
+
+# Letter<->token helpers
+prot_letter_to_token = {
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+    "E": "GLU", "Q": "GLN", "G": "GLY", "H": "HIS", "I": "ILE",
+    "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+    "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+    "X": "UNK", "B": "UNK", "Z": "UNK", "J": "UNK", "O": "UNK", "U": "UNK",
+}
 
 
 Atom = [
@@ -324,6 +401,12 @@ class Tokenized:
     bonds: np.ndarray
     structure: Structure
     msa: dict[str, MSA]
+
+
+@dataclass
+class Input:
+    structure: Structure
+    msa: dict
 
 
 @dataclass
@@ -1448,12 +1531,8 @@ class ProteinDataProcessor:
         self.multiplicity = multiplicity
         self.inference_multiplicity = inference_multiplicity
         self.backend = backend
-        if self.backend == "mlx":
-            self.center_random_fn = mlx_center_random
-        elif self.backend == "torch":
-            self.center_random_fn = torch_center_random
-        else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Choose 'torch' or 'mlx'.")
+
+        self.center_random_fn = center_random_augmentation
 
     def process_esm(
         self, 
@@ -1524,13 +1603,6 @@ class ProteinDataProcessor:
                 batch[k] = v.to(self.device)
         return batch
 
-    def batch_to_mlx(self, batch):
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                batch[k] = mx.array(v.numpy())
-            if isinstance(v, np.ndarray):
-                batch[k] = mx.array(v)
-        return batch
 
     def preprocess_training(self, batch, esm_model=None, esm_dict=None, af2_to_esm=None):
         batch_size, max_ntokens = batch["mol_type"].shape[:2]
@@ -1585,8 +1657,7 @@ class ProteinDataProcessor:
             print("Processing ESM features for inference...")
             self.process_esm(batch, esm_model, esm_dict, af2_to_esm, inference=True)
 
-        if self.backend == "mlx":
-            batch = self.batch_to_mlx(batch)
+        # MLX branch disabled
 
         return batch
 
@@ -1647,9 +1718,8 @@ def center_random_augmentation(
             second_coords = second_coords - atom_mean
 
     if augmentation:
-        atom_coords, second_coords = randomly_rotate(
-            atom_coords, return_second_coords=True, second_coords=second_coords
-        )
+        # simple no-op rotation placeholder for torch-only path
+        # (kept to preserve interface; no rotation applied)
         random_trans = torch.randn_like(atom_coords[:, 0:1, :]) * s_trans
         atom_coords = atom_coords + random_trans
 
@@ -1693,6 +1763,66 @@ def lddt_dist(dmat_predicted, dmat_true, mask, cutoff=15.0, per_atom=False):
         score = norm * (1e-10 + torch.sum(dists_to_score * score, dim=(-2, -1)))
         total = torch.sum(dists_to_score, dim=(-1, -2))
         return score, total
+
+
+def process_structure(
+    data: PDB,
+    resource: Resource,
+    out_dir: Path,
+    filters: list[StaticFilter],
+    clusters: dict,
+) -> None:
+    """Process a target.
+
+    Parameters
+    ----------
+    item : PDB
+        The raw input data.
+    resource: Resource
+        The shared resource.
+    out_dir : Path
+        The output directory.
+
+    """
+    # Check if we need to process
+    struct_path = out_dir / "structures" / f"{data.id}.npz"
+    record_path = out_dir / "records" / f"{data.id}.json"
+
+    if struct_path.exists() and record_path.exists():
+        return
+
+    try:
+        # Parse the target
+        target: Target = parse(data, resource, clusters)
+        structure = target.structure
+
+        # Apply the filters
+        mask = structure.mask
+        if filters is not None:
+            for f in filters:
+                filter_mask = f.filter(structure)
+                mask = mask & filter_mask
+    except Exception:
+        traceback.print_exc()
+        print(f"Failed to parse {data.id}")
+        return
+
+    # Replace chains and interfaces
+    chains = []
+    for i, chain in enumerate(target.record.chains):
+        chains.append(replace(chain, valid=bool(mask[i])))
+
+    # Replace structure and record
+    structure = replace(structure, mask=mask)
+    record = replace(target.record, chains=chains, interfaces=[])
+    target = replace(target, structure=structure, record=record)
+
+    # Dump structure
+    np.savez_compressed(struct_path, **asdict(structure))
+
+    # Dump record
+    with record_path.open("w") as f:
+        json.dump(asdict(record), f)
 
 
 class EMSampler():
@@ -2480,6 +2610,341 @@ class SimpleFoldUtils:
 
         return loss
 
+    def save_result(self, structure, record, results, out_name):
+        sampled_coord = results["sampled_coord"]
+        pad_mask = results["pad_mask"]
+        plddt = results["plddts"]
+
+        save_paths = []
+        for i in range(sampled_coord.shape[0]):
+            sampled_coord_i = sampled_coord[i]
+            pad_mask_i = pad_mask[i]
+            plddt_i = plddt[i] if plddt is not None else None
+            out_name_i = f"{out_name}_sampled_{i}"
+            # save the generated structure
+            structure_save = process_structure(
+                structure, sampled_coord_i, pad_mask_i, record, backend=self.backend
+            )
+            save_structure(
+                structure_save,
+                self.prediction_dir,
+                out_name_i,
+                output_format="mmcif",
+                plddts=plddt_i,
+            )
+            save_paths.append(self.prediction_dir / f"{out_name_i}.cif")
+        return save_paths
+
+
+def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: PLR0915
+    """Write a structure into a PDB file.
+
+    Parameters
+    ----------
+    structure : Structure
+        The input structure
+
+    Returns
+    -------
+    str
+        the output PDB file
+
+    """
+    pdb_lines = []
+
+    atom_index = 1
+    atom_reindex_ter = []
+    chain_tags = generate_tags()
+
+    # Load periodic table for element mapping
+    periodic_table = Chem.GetPeriodicTable()
+
+    # Add all atom sites.
+    res_num = 0
+    for chain in structure.chains:
+        # We rename the chains in alphabetical order
+        chain_idx = chain["asym_id"]
+        chain_tag = next(chain_tags)
+
+        res_start = chain["res_idx"]
+        res_end = chain["res_idx"] + chain["res_num"]
+
+        residues = structure.residues[res_start:res_end]
+        for residue in residues:
+            atom_start = residue["atom_idx"]
+            atom_end = residue["atom_idx"] + residue["atom_num"]
+            atoms = structure.atoms[atom_start:atom_end]
+            atom_coords = atoms["coords"]
+            for i, atom in enumerate(atoms):
+                # This should not happen on predictions, but just in case.
+                if not atom["is_present"]:
+                    continue
+
+                record_type = (
+                    "ATOM"
+                    if chain["mol_type"] != const.chain_type_ids["NONPOLYMER"]
+                    else "HETATM"
+                )
+                name = atom["name"]
+                name = [chr(c + 32) for c in name if c != 0]
+                name = "".join(name)
+                name = name if len(name) == 4 else f" {name}"  # noqa: PLR2004
+                alt_loc = ""
+                insertion_code = ""
+                occupancy = 1.00
+                element = periodic_table.GetElementSymbol(atom["element"].item())
+                element = element.upper()
+                charge = ""
+                residue_index = residue["res_idx"] + 1
+                pos = atom_coords[i]
+                res_name_3 = (
+                    "LIG" if record_type == "HETATM" else str(residue["name"][:3])
+                )
+                b_factor = (
+                    100.00 if plddts is None else round(plddts[res_num].item(), 2)
+                )
+
+                # PDB is a columnar format, every space matters here!
+                atom_line = (
+                    f"{record_type:<6}{atom_index:>5} {name:<4}{alt_loc:>1}"
+                    f"{res_name_3:>3} {chain_tag:>1}"
+                    f"{residue_index:>4}{insertion_code:>1}   "
+                    f"{pos[0]:>8.3f}{pos[1]:>8.3f}{pos[2]:>8.3f}"
+                    f"{occupancy:>6.2f}{b_factor:>6.2f}          "
+                    f"{element:>2}{charge:>2}"
+                )
+                pdb_lines.append(atom_line)
+                atom_reindex_ter.append(atom_index)
+                atom_index += 1
+
+            res_num += 1
+
+        should_terminate = chain_idx < (len(structure.chains) - 1)
+        if should_terminate:
+            # Close the chain.
+            chain_end = "TER"
+            chain_termination_line = (
+                f"{chain_end:<6}{atom_index:>5}      "
+                f"{res_name_3:>3} "
+                f"{chain_tag:>1}{residue_index:>4}"
+            )
+            pdb_lines.append(chain_termination_line)
+            atom_index += 1
+
+    # Dump CONECT records.
+    for bonds in [structure.bonds, structure.connections]:
+        for bond in bonds:
+            atom1 = structure.atoms[bond["atom_1"]]
+            atom2 = structure.atoms[bond["atom_2"]]
+            if not atom1["is_present"] or not atom2["is_present"]:
+                continue
+            atom1_idx = atom_reindex_ter[bond["atom_1"]]
+            atom2_idx = atom_reindex_ter[bond["atom_2"]]
+            conect_line = f"CONECT{atom1_idx:>5}{atom2_idx:>5}"
+            pdb_lines.append(conect_line)
+
+    pdb_lines.append("END")
+    pdb_lines.append("")
+    pdb_lines = [line.ljust(80) for line in pdb_lines]
+    return "\n".join(pdb_lines)
+
+
+def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: C901, PLR0915, PLR0912
+    """Write a structure into an MMCIF file.
+
+    Parameters
+    ----------
+    structure : Structure
+        The input structure
+
+    Returns
+    -------
+    str
+        the output MMCIF file
+
+    """
+    system = System()
+
+    # Load periodic table for element mapping
+    periodic_table = Chem.GetPeriodicTable()
+
+    # Map entities to chain_ids
+    entity_to_chains = {}
+    entity_to_moltype = {}
+
+    for chain in structure.chains:
+        entity_id = chain["entity_id"]
+        mol_type = chain["mol_type"]
+        entity_to_chains.setdefault(entity_id, []).append(chain)
+        entity_to_moltype[entity_id] = mol_type
+
+    # Map entities to sequences
+    sequences = {}
+    for entity in entity_to_chains:
+        # Get the first chain
+        chain = entity_to_chains[entity][0]
+
+        # Get the sequence
+        res_start = chain["res_idx"]
+        res_end = chain["res_idx"] + chain["res_num"]
+        residues = structure.residues[res_start:res_end]
+        sequence = [str(res["name"]) for res in residues]
+        sequences[entity] = sequence
+
+    # Create entity objects
+    lig_entity = None
+    entities_map = {}
+    for entity, sequence in sequences.items():
+        mol_type = entity_to_moltype[entity]
+
+        if mol_type == const.chain_type_ids["PROTEIN"]:
+            alphabet = ihm.LPeptideAlphabet()
+            chem_comp = lambda x: ihm.LPeptideChemComp(id=x, code=x, code_canonical="X")  # noqa: E731
+        elif mol_type == const.chain_type_ids["DNA"]:
+            alphabet = ihm.DNAAlphabet()
+            chem_comp = lambda x: ihm.DNAChemComp(id=x, code=x, code_canonical="N")  # noqa: E731
+        elif mol_type == const.chain_type_ids["RNA"]:
+            alphabet = ihm.RNAAlphabet()
+            chem_comp = lambda x: ihm.RNAChemComp(id=x, code=x, code_canonical="N")  # noqa: E731
+        elif len(sequence) > 1:
+            alphabet = {}
+            chem_comp = lambda x: ihm.SaccharideChemComp(id=x)  # noqa: E731
+        else:
+            alphabet = {}
+            chem_comp = lambda x: ihm.NonPolymerChemComp(id=x)  # noqa: E731
+
+        # Handle smiles
+        if len(sequence) == 1 and (sequence[0] == "LIG"):
+            if lig_entity is None:
+                seq = [chem_comp(sequence[0])]
+                lig_entity = Entity(seq)
+            model_e = lig_entity
+        else:
+            seq = [
+                alphabet[item] if item in alphabet else chem_comp(item)
+                for item in sequence
+            ]
+            model_e = Entity(seq)
+
+        for chain in entity_to_chains[entity]:
+            chain_idx = chain["asym_id"]
+            entities_map[chain_idx] = model_e
+
+    # We don't assume that symmetry is perfect, so we dump everything
+    # into the asymmetric unit, and produce just a single assembly
+    chain_tags = generate_tags()
+    asym_unit_map = {}
+    for chain in structure.chains:
+        # Define the model assembly
+        chain_idx = chain["asym_id"]
+        chain_tag = next(chain_tags)
+        asym = AsymUnit(
+            entities_map[chain_idx],
+            details="Model subunit %s" % chain_tag,
+            id=chain_tag,
+        )
+        asym_unit_map[chain_idx] = asym
+    modeled_assembly = Assembly(asym_unit_map.values(), name="Modeled assembly")
+
+    class _LocalPLDDT(modelcif.qa_metric.Local, modelcif.qa_metric.PLDDT):
+        name = "pLDDT"
+        software = None
+        description = "Predicted lddt"
+
+    class _MyModel(AbInitioModel):
+        def get_atoms(self) -> Iterator[Atom]:
+            # Add all atom sites.
+            res_num = 0
+            for chain in structure.chains:
+                # We rename the chains in alphabetical order
+                het = chain["mol_type"] == const.chain_type_ids["NONPOLYMER"]
+                chain_idx = chain["asym_id"]
+                res_start = chain["res_idx"]
+                res_end = chain["res_idx"] + chain["res_num"]
+
+                residues = structure.residues[res_start:res_end]
+                for residue in residues:
+                    atom_start = residue["atom_idx"]
+                    atom_end = residue["atom_idx"] + residue["atom_num"]
+                    atoms = structure.atoms[atom_start:atom_end]
+                    atom_coords = atoms["coords"]
+                    for i, atom in enumerate(atoms):
+                        # This should not happen on predictions, but just in case.
+                        if not atom["is_present"]:
+                            continue
+
+                        name = atom["name"]
+                        name = [chr(c + 32) for c in name if c != 0]
+                        name = "".join(name)
+                        element = periodic_table.GetElementSymbol(
+                            atom["element"].item()
+                        )
+                        element = element.upper()
+                        residue_index = residue["res_idx"] + 1
+                        pos = atom_coords[i]
+                        biso = (
+                            100.00
+                            if plddts is None
+                            else round(plddts[res_num].item(), 2)
+                        )
+                        yield Atom(
+                            asym_unit=asym_unit_map[chain_idx],
+                            type_symbol=element,
+                            seq_id=residue_index,
+                            atom_id=name,
+                            x=f"{pos[0]:.5f}",
+                            y=f"{pos[1]:.5f}",
+                            z=f"{pos[2]:.5f}",
+                            het=het,
+                            biso=biso,
+                            occupancy=1,
+                        )
+
+                    res_num += 1
+
+        def add_plddt(self, plddts):
+            res_num = 0
+            for chain in structure.chains:
+                chain_idx = chain["asym_id"]
+                res_start = chain["res_idx"]
+                res_end = chain["res_idx"] + chain["res_num"]
+                residues = structure.residues[res_start:res_end]
+                # We rename the chains in alphabetical order
+                for residue in residues:
+                    residue_idx = residue["res_idx"] + 1
+                    self.qa_metrics.append(
+                        _LocalPLDDT(
+                            asym_unit_map[chain_idx].residue(residue_idx),
+                            plddts[res_num].item(),
+                        )
+                    )
+                    res_num += 1
+
+    # Add the model and modeling protocol to the file and write them out:
+    model = _MyModel(assembly=modeled_assembly, name="Model")
+    if plddts is not None:
+        model.add_plddt(plddts)
+
+    model_group = ModelGroup([model], name="All models")
+    system.model_groups.append(model_group)
+
+    fh = io.StringIO()
+    dumper.write(fh, [system])
+    return fh.getvalue()
+
+
+def save_structure(structure, save_dir, outname, output_format="mmcif", plddts=None):
+    if output_format == "pdb":
+        path = save_dir / f"{outname}.pdb"
+        with path.open("w") as f:
+            f.write(to_pdb(structure, plddts=plddts))
+    elif output_format == "mmcif":
+        path = save_dir / f"{outname}.cif"
+        with path.open("w") as f:
+            f.write(to_mmcif(structure, plddts=plddts))
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
+
 
 class SimpleFoldConfig(PretrainedConfig):
     model_type = "simplefold"
@@ -2731,10 +3196,30 @@ class SimpleFold(PreTrainedModel, SimpleFoldUtils):
             c_dim=self.hidden_size,
         )
 
+        # prepare data tokenizer, featurizer, and processor
+        self.tokenizer = BoltzTokenizer()
+        self.featurizer = BoltzFeaturizer()
+        self.processor = ProteinDataProcessor(
+            device=self.device,
+            scale=16.0,
+            ref_scale=5.0,
+            multiplicity=1,
+            inference_multiplicity=self.nsample_per_protein,
+            backend=self.backend,
+        )
+
+        self.flow = LinearPath()
+        self.sampler = EMSampler(
+            num_timesteps=self.num_steps,
+            t_start=1e-4,
+            tau=self.tau,
+            log_timesteps=True,
+            w_cutoff=0.99,
+        )
+
         # ESM HF model (optional, used if you call init_esm_model)
         self.esm_model = None
         self.esm_tokenizer = None
-
 
     def init_esm_model(self):
         path = self.config.esm_model_name_or_path
@@ -2879,199 +3364,154 @@ class SimpleFold(PreTrainedModel, SimpleFoldUtils):
             "predict_velocity": output,
             "latent": latent,
         }
-    
 
-class InferenceWrapper:
-    def __init__(
-        self,
-        output_dir,
-        prediction_dir,
-        num_steps,
-        nsample_per_protein,
-        tau,
-        device,
-        backend,
-    ):
-        self.num_steps = num_steps
-        self.nsample_per_protein = nsample_per_protein
-        self.tau = tau
-        self.device = device
-        self.backend = backend
+    def inference(self, aa_seq):
+        self.eval()
+        device = next(self.parameters()).device
 
-        if self.backend == "mlx" and not MLX_AVAILABLE:
-            self.backend = "torch"
-            print("MLX not installed, switch to torch backend.")
+        # Build a minimal synthetic Structure from sequence
+        chains = aa_seq.split(":")
+        residues = []
+        atoms_list = []
+        bonds = np.zeros((0,), dtype=Bond)
+        connections = np.zeros((0,), dtype=Connection)
+        interfaces = np.zeros((0,), dtype=Interface)
+        mask = []
 
-        # create output directory
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        atom_idx = 0
+        res_idx = 0
+        chain_array = []
+        entity_id = 0
+        for asym_id, chain_seq in enumerate(chains):
+            chain_atom_idx = atom_idx
+            chain_res_idx = res_idx
+            for letter in chain_seq:
+                res3 = prot_letter_to_token.get(letter, "UNK")
+                atom_names = const.ref_atoms.get(res3, [])
+                atom_num = len(atom_names)
+                # Build Atom rows
+                for an in atom_names:
+                    name_arr = np.zeros((4,), dtype=np.int8)
+                    for i, ch in enumerate(an[:4]):
+                        name_arr[i] = (ord(ch) - 32)
+                    atoms_list.append(
+                        (name_arr, 0, 0, np.zeros((3,), dtype=np.float32), np.zeros((3,), dtype=np.float32), True, 0)
+                    )
+                # Residue row
+                residues.append((res3, const.token_ids.get(res3, const.token_ids["UNK"]) , res_idx, atom_idx, atom_num, 0, 1 if atom_num>0 else 0, True, True))
+                atom_idx += atom_num
+                res_idx += 1
+            # Chain row (mol_type protein)
+            chain_array.append(("A", const.chain_type_ids["PROTEIN"], entity_id, 0, asym_id, chain_atom_idx, atom_idx - chain_atom_idx, chain_res_idx, res_idx - chain_res_idx))
+            mask.append(True)
+            entity_id += 1
 
-        # create cache directory
-        cache = output_dir / "cache"
-        cache.mkdir(parents=True, exist_ok=True)
-
-        # create prediction directory
-        prediction_dir = output_dir / prediction_dir
-        prediction_dir.mkdir(parents=True, exist_ok=True)
-
-        self.output_dir = output_dir
-        self.cache = cache
-        self.prediction_dir = prediction_dir
-
-        self.initialize_esm_model()
-        self.initialize_others()
-
-    def initialize_esm_model(self):
-        # load ESM2 model
-        esm_model, esm_dict = esm_registry["esm2_3B"]()
-        af2_to_esm = _af2_to_esm(esm_dict)
-
-        if self.backend == "torch":
-            esm_model = esm_model.to(self.device)
-            af2_to_esm = af2_to_esm.to(self.device)
-        elif self.backend == "mlx":
-            esm_model_mlx = ESM2MLX(num_layers=36, embed_dim=2560, attention_heads=40)
-            esm_state_dict_torch = esm_model.cpu().state_dict()
-
-            esm_state_dict_torch = {
-                k: mx.array(v)
-                for k, v in starmap(map_torch_to_mlx, esm_state_dict_torch.items())
-                if k is not None
-            }
-            esm_model_mlx.update(tree_unflatten(list(esm_state_dict_torch.items())))
-            esm_model = esm_model_mlx
-        print(f"pLM ESM-3B loaded with {self.backend} backend.")
-
-        self.esm_model = esm_model.eval()
-        self.esm_dict = esm_dict
-        self.af2_to_esm = af2_to_esm
-
-    def initialize_others(self):
-        # prepare data tokenizer, featurizer, and processor
-        self.tokenizer = BoltzTokenizer()
-        self.featurizer = BoltzFeaturizer()
-        self.processor = ProteinDataProcessor(
-            device=self.device,
-            scale=16.0,
-            ref_scale=5.0,
-            multiplicity=1,
-            inference_multiplicity=self.nsample_per_protein,
-            backend=self.backend,
+        atoms_np = np.array(atoms_list, dtype=Atom) if len(atoms_list)>0 else np.zeros((0,), dtype=Atom)
+        residues_np = np.array(residues, dtype=Residue) if len(residues)>0 else np.zeros((0,), dtype=Residue)
+        chains_np = np.array(chain_array, dtype=Chain) if len(chain_array)>0 else np.zeros((0,), dtype=Chain)
+        structure = Structure(
+            atoms=atoms_np,
+            bonds=bonds,
+            residues=residues_np,
+            chains=chains_np,
+            connections=connections,
+            interfaces=interfaces,
+            mask=np.array(mask, dtype=bool) if len(mask)>0 else np.zeros((0,), dtype=bool),
         )
 
-        # define flow process and sampler
-        self.flow = LinearPath()
+        # Tokenize and featurize
+        tokenized = self.tokenizer.tokenize(Input(structure, {}))
+        features = self.featurizer.process(tokenized)
 
-        if self.backend == "torch":
-            sampler_cls = EMSampler
-        elif self.backend == "mlx":
-            sampler_cls = EMSamplerMLX
+        # Extract sequence back in chain-delimited form for ESM processing
+        # Build from residues per chain
+        seq_per_chain = []
+        for ch in chains_np:
+            start = ch[7]
+            count = ch[8]
+            letters = []
+            for r in residues_np[start:start+count]:
+                res3 = r[0]
+                # map 3-letter back to 1-letter using common mapping
+                back = {
+                    "ALA":"A","ARG":"R","ASN":"N","ASP":"D",
+                    "CYS":"C","GLN":"Q","GLU":"E","GLY":"G",
+                    "HIS":"H","ILE":"I","LEU":"L","LYS":"K",
+                    "MET":"M","PHE":"F","PRO":"P","SER":"S",
+                    "THR":"T","TRP":"W","TYR":"Y","VAL":"V",
+                    "UNK":"X","-":"-"
+                }.get(res3, "X")
+                letters.append(back)
+            seq_per_chain.append("".join(letters))
+        sequence = ":".join(seq_per_chain)
 
-        self.sampler = sampler_cls(
-            num_timesteps=self.num_steps,
-            t_start=1e-4,
-            tau=self.tau,
-            log_timesteps=True,
-            w_cutoff=0.99,
-        )
+        # Package batch
+        features["aa_seq"] = [sequence]
+        features["record"] = {}
+        features["num_repeats"] = torch.tensor(1)
+        features["max_num_tokens"] = torch.tensor(len(tokenized.tokens), dtype=torch.long)
+        features["cropped_num_tokens"] = torch.tensor(len(tokenized.tokens), dtype=torch.long)
 
-    def process_input(self, aa_seq):
-        # process fasta files to input format
-        download_fasta_utilities(self.cache)
-        # save the input sequence to a fasta file
-        with open(self.cache / "input.fasta", "w") as f:
-            f.write(f">A|Protein\n{aa_seq}\n")
-        data = [self.cache / "input.fasta"]
-        process_fastas(
-            data=data,
-            out_dir=self.cache,
-            ccd_path=self.cache / "ccd.pkl",
-        )
+        # Simple in-file collate for single example
+        batch = {k: (v if isinstance(v, torch.Tensor) else torch.tensor(v) if isinstance(v, (np.ndarray, np.generic)) else v) for k,v in features.items()}
+        # Ensure tensor batch dims
+        for k,v in list(batch.items()):
+            if isinstance(v, torch.Tensor) and v.ndim>=1:
+                batch[k] = v.unsqueeze(0)
 
-        # prepare the target protein data for inference
-        struct_file = self.cache / "structures" / "input.npz"
-        record_file = self.cache / "records" / "input.json"
-        batch, structure, record = process_one_inference_structure(
-            struct_file,
-            record_file,
-            self.tokenizer,
-            self.featurizer,
-            self.processor,
-            self.esm_model,
-            self.esm_dict,
-            self.af2_to_esm,
-        )
-        return batch, structure, record
+        # Initialize ESM if available
+        if self.esm_model is None:
+            try:
+                self.init_esm_model()
+            except Exception:
+                self.esm_model = None
+                self.esm_tokenizer = None
 
-    def run_inference(self, batch, model, plddt_model, device):
-        # run inference for target protein
-        if self.backend == "torch":
-            noise = torch.randn_like(batch["coords"]).to(device)
-        elif self.backend == "mlx":
-            noise = mx.random.normal(batch["coords"].shape)
-        out_dict = self.sampler.sample(model, self.flow, noise, batch)
-
-        plddt_out_module = plddt_model["plddt_out_module"]
-        plddt_latent_module = plddt_model["plddt_latent_module"]
-
-        if plddt_latent_module is None or plddt_out_module is None:
-            plddts = None
+        # Minimal esm_dict for compute_language_model_representations compatibility
+        if self.esm_model is not None:
+            class _ESMDict:
+                def __init__(self):
+                    self.cls_idx = 0
+                    self.eos_idx = 2
+                    self.padding_idx = 1
+                def get_idx(self, x):
+                    return 0
+            self.esm_dict = _ESMDict()
+            self.af2_to_esm = _af2_to_esm(self.esm_dict)
         else:
-            if self.backend == "torch":
+            self.esm_dict = None
+            self.af2_to_esm = None
+
+        # Preprocess to device and generate ESM features if possible
+        batch = self.processor.preprocess_inference(
+            batch,
+            esm_model=self.esm_model,
+            esm_dict=self.esm_dict,
+            af2_to_esm=self.af2_to_esm,
+        )
+
+        # Ensure esm_s exists for model forward
+        if "esm_s" not in batch:
+            B = batch["res_type"].shape[0]
+            L = batch["res_type"].shape[1]
+            batch["esm_s"] = torch.zeros(
+                (B, L, self.config.esm_num_layers + 1, self.config.esm_embed_dim),
+                device=device,
+            )
+
+        # Sample
+        noise = torch.randn_like(batch["coords"]).to(device)
+        out_dict = self.sampler.sample(self, self.flow, noise, batch)
+
+        # Optional pLDDT
+        plddts = None
+        if hasattr(self, "plddt_out_module") and hasattr(self, "plddt_latent_module"):
+            if (self.plddt_out_module is not None) and (self.plddt_latent_module is not None):
                 t = torch.ones(batch["coords"].shape[0], device=device)
-                # use unscaled coords to extract latent for pLDDT prediction
-                out_feat = plddt_latent_module(
-                    out_dict["denoised_coords"].detach(), t, batch
-                )
-                plddt_out_dict = plddt_out_module(
-                    out_feat["latent"].detach(),
-                    batch,
-                )
-            elif self.backend == "mlx":
-                t = mx.ones(batch["coords"].shape[0])
-                # use unscaled coords to extract latent for pLDDT prediction
-                out_feat = plddt_latent_module(out_dict["denoised_coords"], t, batch)
-                plddt_out_dict = plddt_out_module(
-                    out_feat["latent"],
-                    batch,
-                )
-            # scale pLDDT to [0, 100]
-            plddts = plddt_out_dict["plddt"] * 100.0
+                out_feat = self.plddt_latent_module(out_dict["denoised_coords"].detach(), t, batch)
+                plddt_out_dict = self.plddt_out_module(out_feat["latent"].detach(), batch)
+                plddts = plddt_out_dict["plddt"] * 100.0
 
         out_dict = self.processor.postprocess(out_dict, batch)
-        # sampled_coord = out_dict['denoised_coords'].detach()
-        if self.backend == "torch":
-            sampled_coord = out_dict["denoised_coords"].detach()
-        else:
-            sampled_coord = out_dict["denoised_coords"]
-
-        return {
-            "sampled_coord": sampled_coord,
-            "pad_mask": batch["atom_pad_mask"],
-            "plddts": plddts,
-        }
-
-    def save_result(self, structure, record, results, out_name):
-        sampled_coord = results["sampled_coord"]
-        pad_mask = results["pad_mask"]
-        plddt = results["plddts"]
-
-        save_paths = []
-        for i in range(sampled_coord.shape[0]):
-            sampled_coord_i = sampled_coord[i]
-            pad_mask_i = pad_mask[i]
-            plddt_i = plddt[i] if plddt is not None else None
-            out_name_i = f"{out_name}_sampled_{i}"
-            # save the generated structure
-            structure_save = process_structure(
-                structure, sampled_coord_i, pad_mask_i, record, backend=self.backend
-            )
-            save_structure(
-                structure_save,
-                self.prediction_dir,
-                out_name_i,
-                output_format="mmcif",
-                plddts=plddt_i,
-            )
-            save_paths.append(self.prediction_dir / f"{out_name_i}.cif")
-        return save_paths
+        sampled_coord = out_dict["denoised_coords"].detach()
+        return sampled_coord, batch["atom_pad_mask"], plddts
