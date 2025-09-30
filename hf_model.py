@@ -13,13 +13,13 @@ import typing as T
 from torch import Tensor, from_numpy
 from torch.nn.functional import one_hot, pad
 from einops import repeat, rearrange
-from dataclasses import astuple, dataclass
+from dataclasses import astuple, dataclass, asdict
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 from pathlib import Path
 
 
-from transformers import PretrainedConfig, PreTrainedModel
+from transformers import AutoModel, PretrainedConfig, PreTrainedModel
 
 ckpt_url_dict = {
     "simplefold_100M": "https://ml-site.cdn-apple.com/models/simplefold/simplefold_100M.ckpt",
@@ -1924,6 +1924,23 @@ class SwiGLU(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features, act_layer=nn.GELU, drop=0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, in_features)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -2094,29 +2111,24 @@ class DiTBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
 
-    def __init__(
-        self,
-        hidden_size,
-        mlp_ratio=4.0,
-        use_swiglu=True,
-    ):
+    def __init__(self, cfg: "SimpleFoldConfig", hidden_size: int, pos_embedder: T.Optional[nn.Module] = None, num_heads_override: T.Optional[int] = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = SelfAttention(
             hidden_size=hidden_size,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-            use_bias=use_bias,
-            qk_norm=qk_norm,
+            num_heads=(cfg.num_heads if num_heads_override is None else num_heads_override),
+            qkv_bias=cfg.qkv_bias,
+            qk_scale=None,
+            attn_drop=cfg.attn_drop,
+            proj_drop=cfg.proj_drop,
+            use_bias=cfg.attn_use_bias,
+            qk_norm=cfg.qk_norm,
             pos_embedder=pos_embedder,
-            linear_target=linear_target,
+            linear_target=nn.Linear,
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        if use_swiglu:
+        mlp_hidden_dim = int(hidden_size * cfg.mlp_ratio)
+        if cfg.use_swiglu:
             self.mlp = SwiGLU(hidden_size, mlp_hidden_dim)
         else:
             approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -2166,33 +2178,28 @@ class DiTBlock(nn.Module):
 
 class TransformerBlock(nn.Module):
     """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A standard Transformer block (no adaLN conditioning).
     """
 
-    def __init__(
-        self,
-        hidden_size,
-        mlp_ratio=4.0,
-        use_swiglu=False,
-    ):
+    def __init__(self, cfg: "SimpleFoldConfig", hidden_size: int, pos_embedder: T.Optional[nn.Module] = None, num_heads_override: T.Optional[int] = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = SelfAttention(
             hidden_size=hidden_size,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-            use_bias=use_bias,
-            qk_norm=qk_norm,
+            num_heads=(cfg.num_heads if num_heads_override is None else num_heads_override),
+            qkv_bias=cfg.qkv_bias,
+            qk_scale=None,
+            attn_drop=cfg.attn_drop,
+            proj_drop=cfg.proj_drop,
+            use_bias=cfg.attn_use_bias,
+            qk_norm=cfg.qk_norm,
             pos_embedder=pos_embedder,
-            linear_target=linear_target,
+            linear_target=nn.Linear,
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        mlp_hidden_dim = int(hidden_size * cfg.mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        if use_swiglu:
+        if cfg.use_swiglu:
             self.mlp = SwiGLU(hidden_size, mlp_hidden_dim)
         else:
             self.mlp = Mlp(
@@ -2214,15 +2221,33 @@ class TransformerBlock(nn.Module):
 
 
 class HomogenTrunk(nn.Module):
-    def __init__(self, block, depth):
+    def __init__(self, block_ctor: T.Callable[[], nn.Module], depth: int):
         super().__init__()
-        self.blocks = nn.ModuleList([block() for _ in range(depth)])
+        self.blocks = nn.ModuleList([block_ctor() for _ in range(depth)])
 
     def forward(self, latents, c, **kwargs):
         for i, block in enumerate(self.blocks):
             kwargs["layer_idx"] = i
             latents = block(latents=latents, c=c, **kwargs)
         return latents
+
+
+class StackedDiT(nn.Module):
+    def __init__(
+        self,
+        cfg: "SimpleFoldConfig",
+        hidden_size: int,
+        depth: int,
+        num_heads_override: T.Optional[int] = None,
+        pos_embedder: T.Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        def ctor():
+            return DiTBlock(cfg=cfg, hidden_size=hidden_size, pos_embedder=pos_embedder, num_heads_override=num_heads_override)
+        self.trunk = HomogenTrunk(block_ctor=ctor, depth=depth)
+
+    def forward(self, latents, c, **kwargs):
+        return self.trunk(latents=latents, c=c, **kwargs)
 
 
 class SimpleFoldUtils:
@@ -2457,86 +2482,185 @@ class SimpleFoldUtils:
 
 
 class SimpleFoldConfig(PretrainedConfig):
+    model_type = "simplefold"
     def __init__(
         self,
-        ema_decay=0.999,
-        esm_model="esm2_3B",
-        aa_bolt_link=None,
-        use_rigid_align=True,
-        smooth_lddt_loss_weight=1.0,
-        lddt_cutoff=15.0,
-        clip_grad_norm_val=None,
-        lddt_weight_schedule=False,
-        plddt_training=False,
-        sample_dir='artifacts/',
-        hidden_size=1152,
-        num_heads=16,
-        atom_num_heads=4,
-        output_channels=3,
-        atom_hidden_size_enc=256,
-        atom_hidden_size_dec=256,
-        atom_n_queries_enc=32,
-        atom_n_keys_enc=128,
-        atom_n_queries_dec=32,
-        atom_n_keys_dec=128,
-        esm_dropout_prob=0.0,
-        use_atom_mask=False,
-        use_length_condition=True,
+        # General
+        ema_decay: float = 0.999,
+        esm_model_name_or_path: str = "Synthyra/ESM2-3B",
+        use_rigid_align: bool = True,
+        smooth_lddt_loss_weight: float = 1.0,
+        lddt_cutoff: float = 15.0,
+        clip_grad_norm_val: T.Optional[float] = None,
+        lddt_weight_schedule: bool = False,
+        plddt_training: bool = False,
+        sample_dir: str = 'artifacts/',
+
+        # Residue trunk
+        hidden_size: int = 1152,
+        num_heads: int = 16,
+        trunk_depth: int = 24,
+        mlp_ratio: float = 4.0,
+        use_swiglu: bool = True,
+        qkv_bias: bool = True,
+        qk_norm: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        attn_use_bias: bool = True,
+        rope_base: float = 100.0,
+
+        # Atom encoder/decoder
+        output_channels: int = 3,
+        atom_hidden_size_enc: int = 256,
+        atom_hidden_size_dec: int = 256,
+        atom_num_heads: int = 4,
+        encoder_depth: int = 8,
+        decoder_depth: int = 8,
+        atom_n_queries_enc: int = 32,
+        atom_n_keys_enc: int = 128,
+        atom_n_queries_dec: int = 32,
+        atom_n_keys_dec: int = 128,
+
+        # ESM integration
+        esm_num_layers: int = 36,
+        esm_embed_dim: int = 2560,
+        esm_dropout_prob: float = 0.0,
+
+        # Feature toggles
+        use_atom_mask: bool = False,
+        use_length_condition: bool = True,
+
+        # Positional embeddings
+        coord_pe_num_freqs: int = 32,
+        coord_pe_min_freq_log2: float = 0.0,
+        coord_pe_max_freq_log2: float = 12.0,
+        coord_pe_include_input: bool = False,
+        aa_pos_embed_dim: int = 64,
+        time_embed_dim: int = 256,
+
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.ema_decay = ema_decay
+        self.esm_model_name_or_path = esm_model_name_or_path
+        self.use_rigid_align = use_rigid_align
+        self.smooth_lddt_loss_weight = smooth_lddt_loss_weight
+        self.lddt_cutoff = lddt_cutoff
+        self.clip_grad_norm_val = clip_grad_norm_val
+        self.lddt_weight_schedule = lddt_weight_schedule
+        self.plddt_training = plddt_training
+        self.sample_dir = sample_dir
+
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.trunk_depth = trunk_depth
+        self.mlp_ratio = mlp_ratio
+        self.use_swiglu = use_swiglu
+        self.qkv_bias = qkv_bias
+        self.qk_norm = qk_norm
+        self.attn_drop = attn_drop
+        self.proj_drop = proj_drop
+        self.attn_use_bias = attn_use_bias
+        self.rope_base = rope_base
+
+        self.output_channels = output_channels
+        self.atom_hidden_size_enc = atom_hidden_size_enc
+        self.atom_hidden_size_dec = atom_hidden_size_dec
+        self.atom_num_heads = atom_num_heads
+        self.encoder_depth = encoder_depth
+        self.decoder_depth = decoder_depth
+        self.atom_n_queries_enc = atom_n_queries_enc
+        self.atom_n_keys_enc = atom_n_keys_enc
+        self.atom_n_queries_dec = atom_n_queries_dec
+        self.atom_n_keys_dec = atom_n_keys_dec
+
+        self.esm_num_layers = esm_num_layers
+        self.esm_embed_dim = esm_embed_dim
+        self.esm_dropout_prob = esm_dropout_prob
+
+        self.use_atom_mask = use_atom_mask
+        self.use_length_condition = use_length_condition
+
+        self.coord_pe_num_freqs = coord_pe_num_freqs
+        self.coord_pe_min_freq_log2 = coord_pe_min_freq_log2
+        self.coord_pe_max_freq_log2 = coord_pe_max_freq_log2
+        self.coord_pe_include_input = coord_pe_include_input
+        self.aa_pos_embed_dim = aa_pos_embed_dim
+        self.time_embed_dim = time_embed_dim
 
 
 class SimpleFold(PreTrainedModel, SimpleFoldUtils):
     config_class = SimpleFoldConfig
     def __init__(self, config: SimpleFoldConfig):
-        PreTrainedModel.__init__(config)
-        SimpleFoldUtils.__init__()
+        PreTrainedModel.__init__(self, config)
+        SimpleFoldUtils.__init__(self)
         self.config = config
 
-
-
-
-        self.model = architecture
-
-        self.loss = loss
-        self.path = path
-        self.sampler = sampler
-
-        self.use_rigid_align = use_rigid_align
-        self.lddt_cutoff = lddt_cutoff
-        self.smooth_lddt_loss_weight = smooth_lddt_loss_weight
-        self.use_smooth_lddt_loss = smooth_lddt_loss_weight > 0.0
-        self.lddt_weight_schedule = lddt_weight_schedule
-        self.sample_dir = sample_dir
-
-        self.aa_bolt_link = aa_bolt_link
+        # Core training/inference settings
+        self.use_rigid_align = config.use_rigid_align
+        self.lddt_cutoff = config.lddt_cutoff
+        self.smooth_lddt_loss_weight = config.smooth_lddt_loss_weight
+        self.use_smooth_lddt_loss = config.smooth_lddt_loss_weight > 0.0
+        self.lddt_weight_schedule = config.lddt_weight_schedule
+        self.sample_dir = config.sample_dir
         self.nval_steps = 0
+        self.t_eps = 0.0
 
-        try:
-            self.t_eps = self.sampler.t_eps
-        except AttributeError:
-            self.t_eps = 0.0
+        # Embedders
+        self.pos_embedder = FourierPositionEncoding(
+            in_dim=3,
+            include_input=config.coord_pe_include_input,
+            min_freq_log2=config.coord_pe_min_freq_log2,
+            max_freq_log2=config.coord_pe_max_freq_log2,
+            num_freqs=config.coord_pe_num_freqs,
+            log_sampling=True,
+        )
+        pos_embed_channels = self.pos_embedder.embed_dim
 
-        """
-        ### TODO currently unaccounted for
-        trunk,
-        time_embedder,
-        aminoacid_pos_embedder,
-        pos_embedder,
-        atom_encoder_transformer,
-        atom_decoder_transformer,
-        """
+        self.aminoacid_pos_embedder = AbsolutePositionEncoding(
+            in_dim=1,
+            embed_dim=config.aa_pos_embed_dim,
+            include_input=False,
+        )
+        aminoacid_pos_embed_channels = self.aminoacid_pos_embedder.embed_dim
 
-        self.pos_embedder = pos_embedder
-        pos_embed_channels = pos_embedder.embed_dim
-        self.aminoacid_pos_embedder = aminoacid_pos_embedder
-        aminoacid_pos_embed_channels = aminoacid_pos_embedder.embed_dim
-        self.time_embedder = time_embedder
-        self.atom_encoder_transformer = atom_encoder_transformer
-        self.atom_decoder_transformer = atom_decoder_transformer
-        self.trunk = trunk
+        self.time_embedder = TimestepEmbedder(
+            hidden_size=config.hidden_size,
+            frequency_embedding_size=config.time_embed_dim,
+        )
 
+        # Attention rotary embeddings for atoms and tokens
+        self.atom_rope = AxialRotaryPositionEncoding(
+            in_dim=4, embed_dim=config.atom_hidden_size_enc, num_heads=config.atom_num_heads, base=config.rope_base
+        )
+        self.token_rope = AxialRotaryPositionEncoding(
+            in_dim=4, embed_dim=config.hidden_size, num_heads=config.num_heads, base=config.rope_base
+        )
+
+        # Transformer stacks
+        self.atom_encoder_transformer = StackedDiT(
+            cfg=config,
+            hidden_size=config.atom_hidden_size_enc,
+            depth=config.encoder_depth,
+            num_heads_override=config.atom_num_heads,
+            pos_embedder=self.atom_rope,
+        )
+        self.atom_decoder_transformer = StackedDiT(
+            cfg=config,
+            hidden_size=config.atom_hidden_size_dec,
+            depth=config.decoder_depth,
+            num_heads_override=config.atom_num_heads,
+            pos_embedder=self.atom_rope,
+        )
+        self.trunk = StackedDiT(
+            cfg=config,
+            hidden_size=config.hidden_size,
+            depth=config.trunk_depth,
+            num_heads_override=config.num_heads,
+            pos_embedder=self.token_rope,
+        )
+
+        # Projections and heads
         self.hidden_size = config.hidden_size
         self.output_channels = config.output_channels
         self.num_heads = config.num_heads
@@ -2544,9 +2668,6 @@ class SimpleFold(PreTrainedModel, SimpleFoldUtils):
         self.use_atom_mask = config.use_atom_mask
         self.esm_dropout_prob = config.esm_dropout_prob
         self.use_length_condition = config.use_length_condition
-
-        esm_s_dim = esm_model_dict[esm_model]["esm_s_dim"]
-        esm_num_layers = esm_model_dict[esm_model]["esm_num_layers"]
 
         self.atom_hidden_size_enc = config.atom_hidden_size_enc
         self.atom_hidden_size_dec = config.atom_hidden_size_dec
@@ -2571,9 +2692,9 @@ class SimpleFold(PreTrainedModel, SimpleFoldUtils):
 
         self.atom_in_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
 
-        self.esm_s_combine = nn.Parameter(torch.zeros(esm_num_layers))
+        self.esm_s_combine = nn.Parameter(torch.zeros(config.esm_num_layers))
         self.esm_s_proj = ConditionEmbedder(
-            input_dim=esm_s_dim,
+            input_dim=config.esm_embed_dim,
             hidden_size=self.hidden_size,
             dropout_prob=self.esm_dropout_prob,
         )
@@ -2605,15 +2726,21 @@ class SimpleFold(PreTrainedModel, SimpleFoldUtils):
         )
 
         self.final_layer = FinalLayer(
-            self.atom_hidden_size_dec, 
-            self.output_channels, 
-            c_dim=self.hidden_size
+            self.atom_hidden_size_dec,
+            self.output_channels,
+            c_dim=self.hidden_size,
         )
+
+        # ESM HF model (optional, used if you call init_esm_model)
+        self.esm_model = None
+        self.esm_tokenizer = None
 
 
     def init_esm_model(self):
-        ESM_PATH = 'Synthyra/ESM2-3B' # 3 billion is used for all current SimpleFold models
-        pass
+        path = self.config.esm_model_name_or_path
+        self.esm_model = AutoModel.from_pretrained(path, trust_remote_code=True)
+        # Some ESM HF models expose a tokenizer attribute, others require separate AutoTokenizer
+        self.esm_tokenizer = getattr(self.esm_model, "tokenizer", None)
 
     def init_plddt_modules(self):
         # loads plddt modules from checkpoints
